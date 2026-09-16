@@ -1,0 +1,342 @@
+const getApiBase = () => {
+  if (import.meta.env.VITE_API_URL) {
+    const raw = import.meta.env.VITE_API_URL.replace(/\/$/, '');
+    return raw.endsWith('/api/v1') ? raw : `${raw}/api/v1`;
+  }
+  // When running locally in development, connect to local Spring Boot backend
+  if (typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')) {
+    return 'http://localhost:8080/api/v1';
+  }
+  // Fallback for cloud deployment (e.g. Vercel)
+  return 'https://secure-digital-document-management.onrender.com/api/v1';
+};
+
+const API_BASE = getApiBase();
+
+export const getAuthToken = () => localStorage.getItem('secure_doc_jwt_token');
+export const setAuthToken = (token) => localStorage.setItem('secure_doc_jwt_token', token);
+export const clearAuthToken = () => localStorage.removeItem('secure_doc_jwt_token');
+
+export const getStoredUser = () => {
+  const user = localStorage.getItem('secure_doc_user');
+  return user ? JSON.parse(user) : null;
+};
+export const setStoredUser = (user) => localStorage.setItem('secure_doc_user', JSON.stringify(user));
+export const clearStoredUser = () => localStorage.removeItem('secure_doc_user');
+
+async function request(endpoint, options = {}) {
+  const token = getAuthToken();
+  const headers = {
+    ...(options.headers || {}),
+  };
+
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+
+  if (!(options.body instanceof FormData) && !headers['Content-Type']) {
+    headers['Content-Type'] = 'application/json';
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 4000); // 4-second timeout
+
+  const res = await fetch(`${API_BASE}${endpoint}`, {
+    ...options,
+    credentials: 'include', // Support HttpOnly/Secure/SameSite session cookies
+    headers,
+    signal: controller.signal,
+  });
+
+  clearTimeout(timeoutId);
+
+  if (!res.ok) {
+    if (res.status === 401 && !endpoint.includes('/auth/login')) {
+      clearAuthToken();
+      clearStoredUser();
+      if (window.location.pathname !== '/login') {
+        window.location.href = '/login';
+      }
+    }
+    let errorMessage = `Request failed with status ${res.status}`;
+    try {
+      const errorData = await res.json();
+      errorMessage = errorData.message || errorData.error || errorMessage;
+    } catch (_) {
+      try {
+        errorMessage = await res.text();
+      } catch (__) {}
+    }
+    const err = new Error(errorMessage);
+    err.status = res.status;
+    throw err;
+  }
+
+  const contentType = res.headers.get('content-type');
+  if (contentType && contentType.includes('application/json')) {
+    return await res.json();
+  }
+  return res;
+}
+
+export const api = {
+  // Auth
+  login: (username, password) => request('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ username, password }),
+  }),
+  verifyTotp: (preAuthToken, code) => request('/auth/mfa/verify', {
+    method: 'POST',
+    body: JSON.stringify({ preAuthToken, code }),
+  }),
+  refreshToken: (refreshToken) => request('/auth/refresh', {
+    method: 'POST',
+    body: JSON.stringify({ refreshToken }),
+  }),
+  requestPasswordReset: (identifier) => request('/auth/password-reset/request', {
+    method: 'POST',
+    body: JSON.stringify({ identifier }),
+  }),
+  confirmPasswordReset: (token, newPassword) => request('/auth/password-reset/confirm', {
+    method: 'POST',
+    body: JSON.stringify({ token, newPassword }),
+  }),
+  logout: () => request('/auth/logout', {
+    method: 'POST',
+  }),
+
+  // Cases
+  getCases: () => request('/cases'),
+  search: async (q) => {
+    try {
+      return await request(`/cases?search=${encodeURIComponent(q)}`);
+    } catch (_) {
+      return [];
+    }
+  },
+  getCaseDetails: (id) => request(`/cases/${id}`),
+  createCase: (data) => request('/cases', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  assignTeam: (caseId, data) => request(`/cases/${caseId}/assign`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  updateCaseStatus: (caseId, data) => request(`/cases/${caseId}/status`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  placeLegalHold: (caseId, reason) => request(`/cases/${caseId}/legal-hold`, {
+    method: 'POST',
+    body: JSON.stringify({ reason }),
+  }),
+  liftLegalHold: (caseId) => request(`/cases/${caseId}/lift-legal-hold`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  }),
+  closeCase: (caseId) => request(`/cases/${caseId}/close`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  }),
+
+  // Documents & Immutable Versions
+  getCaseDocuments: (caseId) => request(`/cases/${caseId}/documents`),
+  uploadDocument: (caseId, formData) => request(`/cases/${caseId}/documents`, {
+    method: 'POST',
+    body: formData,
+  }),
+  uploadDocumentVersion: (documentId, formData) => request(`/documents/${documentId}/versions`, {
+    method: 'POST',
+    body: formData,
+  }),
+  getDocumentVersions: (documentId) => request(`/documents/${documentId}/versions`),
+  downloadDocument: async (documentId, filename) => {
+    const res = await request(`/documents/${documentId}/download`);
+    const blob = await res.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename || 'document';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.URL.revokeObjectURL(url);
+  },
+  downloadDocumentVersion: async (documentId, versionNumber, filename) => {
+    const res = await request(`/documents/${documentId}/versions/${versionNumber}/download`);
+    const blob = await res.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename || `document_v${versionNumber}`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.URL.revokeObjectURL(url);
+  },
+  signDocument: (documentId) => request(`/documents/${documentId}/sign`, {
+    method: 'POST',
+  }),
+
+  // Evidence & Immutable Versions
+  getCaseEvidence: (caseId) => request(`/cases/${caseId}/evidence`),
+  registerEvidence: (caseId, data) => request(`/cases/${caseId}/evidence`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  createEvidenceVersion: (evidenceId, data) => request(`/evidence/${evidenceId}/versions`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  getEvidenceVersions: (evidenceId) => request(`/evidence/${evidenceId}/versions`),
+  initiateCustodyTransfer: (evidenceId, data) => request(`/evidence/${evidenceId}/transfer-request`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  acceptCustodyTransfer: (transferId, verificationNotes) => request(`/evidence/transfers/${transferId}/accept`, {
+    method: 'POST',
+    body: JSON.stringify({ verificationNotes }),
+  }),
+  getCustodyTimeline: (evidenceId) => request(`/evidence/${evidenceId}/custody`),
+  getPendingTransfers: () => request('/evidence/transfers/pending'),
+
+  // Prosecution & Court
+  getPreTrialBundle: (caseId) => request(`/court/cases/${caseId}/bundle`),
+  recordCourtHearing: (caseId, data) => request(`/court/cases/${caseId}/hearings`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  getCourtHearings: (caseId) => request(`/court/cases/${caseId}/hearings`),
+  getChargeSheet: (caseId) => request(`/cases/${caseId}/charge-sheet`),
+  submitChargeSheet: (caseId, documentId) => request(`/cases/${caseId}/charge-sheet`, {
+    method: 'POST',
+    body: JSON.stringify({ documentId }),
+  }),
+  reviewChargeSheet: (id, data) => request(`/charge-sheets/${id}/senior-review`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  prosecutorSignChargeSheet: (id, data) => request(`/charge-sheets/${id}/prosecutor-sign`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  fileInCourt: (caseId, data) => request(`/cases/${caseId}/court-filing`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  getCourtFilings: (caseId) => request(`/cases/${caseId}/court-filings`),
+  getForensicReports: (caseId) => request(`/cases/${caseId}/forensic-reports`),
+
+  // Audit Ledger & Security Alerts
+  getAuditLogs: () => request('/audit/logs'),
+  verifyHashChain: () => request('/audit/verify'),
+  getSecurityAlerts: () => request('/security/alerts'),
+  resolveSecurityAlert: (id, notes) => request(`/security/alerts/${id}/resolve`, {
+    method: 'POST',
+    body: JSON.stringify({ notes }),
+  }),
+
+  // Quarantine Repository
+  getQuarantinedItems: () => request('/quarantine'),
+  releaseQuarantineItem: (id, notes) => request(`/quarantine/${id}/release`, {
+    method: 'POST',
+    body: JSON.stringify({ notes }),
+  }),
+  purgeQuarantineItem: (id) => request(`/quarantine/${id}`, {
+    method: 'DELETE',
+  }),
+
+  // Approvals Matrix
+  getApprovals: () => request('/approvals'),
+  getApprovalsForEntity: (entityId) => request(`/approvals/entity/${entityId}`),
+
+  // Retention & Disposal
+  getRetentionPolicies: () => request('/retention/policies'),
+  createRetentionPolicy: (data) => request('/retention/policies', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  getDisposalRecords: () => request('/retention/disposals'),
+  executeDisposal: (caseId, data) => request(`/retention/disposals/${caseId}`, {
+    method: 'POST',
+    body: JSON.stringify(data || {}),
+  }),
+  archiveCase: (caseId, data) => request(`/retention/cases/${caseId}/archive`, {
+    method: 'POST',
+    body: JSON.stringify(data || {}),
+  }),
+
+  // Admin Users & Roles
+  getUsers: () => request('/users'),
+  createUser: (data) => request('/users', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  bulkCreateUsers: (usersList) => request('/users/bulk', {
+    method: 'POST',
+    body: JSON.stringify(usersList),
+  }),
+  updateUserStatus: (id, enabled, locked) => request(`/users/${id}/status`, {
+    method: 'PATCH',
+    body: JSON.stringify({ enabled, locked }),
+  }),
+  getRoles: () => request('/admin/roles'),
+  getPermissions: () => request('/admin/permissions'),
+  updateRolePermissions: (roleId, permissionIds) => request(`/admin/roles/${roleId}/permissions`, {
+    method: 'PUT',
+    body: JSON.stringify(permissionIds),
+  }),
+
+  // Search
+  search: (query) => request(`/search?q=${encodeURIComponent(query)}`),
+
+  // Backup and disaster recovery architecture
+  getBackupStatus: () => request('/backup/status'),
+  getBackupHistory: () => request('/backup/history'),
+  triggerBackup: (type = 'PARALLEL_SYSTEM') => request('/backup/trigger', {
+    method: 'POST',
+    body: JSON.stringify({ type }),
+  }),
+  testRestore: (backupId) => request('/backup/test-restore', {
+    method: 'POST',
+    body: JSON.stringify({ backupId: backupId || '' }),
+  }),
+  downloadBackupUrl: (backupId) => `${API_BASE}/backup/download/${backupId}`,
+
+  // ─── AI Forensic & Evidentiary Scrutiny Analysis ─────────────────────
+  runForensicAnalysis: (forensicReportId) => request(`/ai/analyze/forensic-report/${forensicReportId}`, {
+    method: 'POST',
+  }),
+  runChargeSheetAnalysis: (chargeSheetId) => request(`/ai/analyze/charge-sheet/${chargeSheetId}`, {
+    method: 'POST',
+  }),
+  runCaseAnalysis: (caseId) => request(`/ai/analyze/case/${caseId}`, {
+    method: 'POST',
+  }),
+  getAiResults: (caseId) => request(`/ai/results/case/${caseId}`),
+  getAiResultById: (id) => request(`/ai/results/${id}`),
+
+  // ─── Actual Blockchain Trust Layer (EVM / Web3) ──────────────────────
+  getBlockchainStatus: () => request('/blockchain/status'),
+  getBlockchainReceipts: () => request('/blockchain/receipts'),
+  getBlockchainCaseReceipts: (caseId) => request(`/blockchain/receipts/case/${caseId}`),
+  verifyBlockchainEvidence: (evidenceIdentifier, currentHash) => 
+    request(`/blockchain/evidence/${evidenceIdentifier}/verify${currentHash ? `?currentHash=${encodeURIComponent(currentHash)}` : ''}`),
+  anchorBlockchainEvidence: (evidenceIdentifier) => 
+    request(`/blockchain/evidence/${evidenceIdentifier}/anchor`, { method: 'POST' }),
+  verifyBlockchainDocument: (documentId, version = 1) => 
+    request(`/blockchain/document/${documentId}/verify?version=${version}`),
+  anchorBlockchainDocument: (documentId) => 
+    request(`/blockchain/document/${documentId}/anchor`, { method: 'POST' }),
+
+  // ─── RBAC Role & Permission Management ──────────────────────────────
+  getRoles: () => request('/admin/roles'),
+  getPermissions: () => request('/admin/permissions'),
+  updateRolePermissions: (roleId, permissionIds) => request(`/admin/roles/${roleId}/permissions`, {
+    method: 'PUT',
+    body: JSON.stringify(permissionIds),
+  }),
+};
+
+export default api;
